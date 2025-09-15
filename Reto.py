@@ -14,7 +14,7 @@ from meteostat import Point, Daily
 # ================
 # 1) DESCARGA DATA
 # ================
-# Ubicación (puedes cambiarla por tu ciudad)
+# Ubicación (se puede cambiar dependiendo de la ciudad deseada)
 ciudad = Point(19.4326, -99.1332)  # Ciudad de México
 inicio = datetime(2023, 1, 1)
 fin    = datetime(2024, 12, 31)
@@ -22,7 +22,7 @@ fin    = datetime(2024, 12, 31)
 # Descarga diaria
 df = Daily(ciudad, inicio, fin).fetch()
 
-# Tomamos la temperatura promedio diaria (tavg). Puede tener NaN; los eliminamos.
+# Tomamos la temperatura promedio diaria (tavg). Eliminamos NaN.
 serie = df['tavg'].dropna().astype(float)
 
 # Señal cruda (data_raw) como vector numpy
@@ -35,13 +35,13 @@ print(f"Observaciones crudas: {len(data_raw)} días, "
 # =====================================================
 # 2) DIGITALIZACIÓN: SAMPLING + QUANTIZATION (data_digitized)
 # =====================================================
-# --- Sampling: reducir frecuencia (tomar 1 de cada N) ---
-N = 3  # por ejemplo, de 1/día a 1 cada 3 días
+# --- Sampling
+N = 3  
 data_sampled = data_raw[::N]
 fs_sampled = fs_raw / N
 
-# --- Quantization: reducir niveles de amplitud ---
-levels = 128  # número de niveles (puedes probar 4, 8, 16, ...)
+# --- Quantization ---
+levels = 128  # número de niveles de cuantización
 xmin, xmax = np.min(data_raw), np.max(data_raw)
 q_step = (xmax - xmin) / levels
 # cuantizamos sobre la señal muestreada para obtener "data_digitized"
