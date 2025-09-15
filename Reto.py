@@ -1,305 +1,161 @@
-# pipeline_digitalizacion_airquality.py
-# -------------------------------------
-# Digitalización (muestreo + cuantización) y filtrado (Luenberger + Kalman)
-# sobre el dataset AirQualityUCI (Kaggle/UCI).
-#
-# Requiere: numpy, pandas, matplotlib
-# Ejecuta:  python pipeline_digitalizacion_airquality.py
+# -*- coding: utf-8 -*-
+"""
+Práctica: Digitalización y filtrado de señales con datos NOAA (vía Meteostat)
+- Señal: temperatura diaria promedio (tavg) en °C
+- Dataset: NOAA/GHCN a través de la librería Meteostat
+"""
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from dataclasses import dataclass
+from datetime import datetime
+from meteostat import Point, Daily
 
-# =========================
-# PARÁMETROS PRINCIPALES
-# =========================
-CSV_PATH   = r"Modulo_Hardware\AirQualityUCI.csv"  # <-- ruta a tu CSV
-SENSOR_COL = "T"                             # "T" (Temperatura) o "RH" (Humedad)
-DATE_COL   = None
-TIME_COL   = None
+# ================
+# 1) DESCARGA DATA
+# ================
+# Ubicación (puedes cambiarla por tu ciudad)
+ciudad = Point(19.4326, -99.1332)  # Ciudad de México
+inicio = datetime(2023, 1, 1)
+fin    = datetime(2024, 12, 31)
 
-# Rejilla uniforme de referencia (el dataset es cada minuto)
-RAW_RESAMPLE_RULE = "1min"
+# Descarga diaria
+df = Daily(ciudad, inicio, fin).fetch()
 
-# Digitalización simulada
-DOWNSAMPLE_FACTOR = 10   # toma 1 de cada N (simula menor frecuencia)
-QUANT_BITS        = 6    # bits de cuantización (menos que el raw)
+# Tomamos la temperatura promedio diaria (tavg). Puede tener NaN; los eliminamos.
+serie = df['tavg'].dropna().astype(float)
 
-# Observador de Luenberger (modelo AR(1) estimado)
-LAMBDA_OBS = 0.75        # polo deseado del error del observador (0.6-0.9 típico)
+# Señal cruda (data_raw) como vector numpy
+data_raw = serie.values
+fs_raw = 1.0  # 1 muestra/día (frecuencia original estimada para tavg)
 
-# Kalman escalar (mismo modelo AR(1))
-Q_PROCESS  = 1e-3        # varianza del proceso
-R_MEASURE  = 1e-2        # varianza de medición
+print(f"Observaciones crudas: {len(data_raw)} días, "
+      f"desde {serie.index.min().date()} hasta {serie.index.max().date()}")
 
-# Ventana de visualización (None para todo)
-PLOT_N_SAMPLES = 2000
+# =====================================================
+# 2) DIGITALIZACIÓN: SAMPLING + QUANTIZATION (data_digitized)
+# =====================================================
+# --- Sampling: reducir frecuencia (tomar 1 de cada N) ---
+N = 3  # por ejemplo, de 1/día a 1 cada 3 días
+data_sampled = data_raw[::N]
+fs_sampled = fs_raw / N
 
-# Guardar resultados a CSV (opcional)
-SAVE_OUTPUTS = False
-OUTPUT_PREFIX = "airquality_results"  # se usarán sufijos _raw/_digitized/_luen/_kal
+# --- Quantization: reducir niveles de amplitud ---
+levels = 128  # número de niveles (puedes probar 4, 8, 16, ...)
+xmin, xmax = np.min(data_raw), np.max(data_raw)
+q_step = (xmax - xmin) / levels
+# cuantizamos sobre la señal muestreada para obtener "data_digitized"
+data_digitized = np.round((data_sampled - xmin) / q_step) * q_step + xmin
 
-
-# =========================
-# CARGA Y LIMPIEZA DEL CSV
-# =========================
-import re
-import numpy as np
-import pandas as pd
-
-def _norm(s: str) -> str:
-    """Normaliza un nombre de columna: quita BOM/espacios/símbolos y pasa a lower."""
-    if not isinstance(s, str):
-        s = str(s)
-    s = s.replace("\ufeff", "")          # BOM
-    s = s.strip()
-    s = re.sub(r"[^a-zA-Z0-9]+", "", s)  # quita todo salvo a-zA-Z0-9
-    return s.lower()
-
-def _find_col_by_alias(df: pd.DataFrame, aliases):
-    """Busca en df.columns el primer nombre que, normalizado, coincida con alguno de aliases."""
-    norm_map = {c: _norm(c) for c in df.columns}
-    aliases  = [_norm(a) for a in aliases]
-    for real, n in norm_map.items():
-        if n in aliases:
-            return real
-    return None
-
-def load_timeseries_csv(path, value_col, date_col=None, time_col=None):
-    # 1) Leer CSV con formato UCI/Kaggle
-    df = pd.read_csv(
-        path,
-        sep=";",
-        decimal=",",
-        encoding="latin1",
-        engine="python",
-        na_values=[-200, "-200", "", "NA", "NaN"]
-    )
-
-    # 2) Quitar columnas “Unnamed”
-    df = df.loc[:, ~df.columns.str.contains(r"^Unnamed", na=False)]
-
-    # 3) Si no nos dan Date/Time, autodetectar (robusto)
-    if date_col is None or date_col not in df.columns:
-        date_col = _find_col_by_alias(df, ["date", "fecha"])
-    if time_col is None or time_col not in df.columns:
-        time_col = _find_col_by_alias(df, ["time", "hora"])
-
-    # Si no hay par date+time, intentar combinadas
-    combined_col = None
-    if date_col is None or time_col is None:
-        combined_col = _find_col_by_alias(df, ["datetime", "datetimestamp", "datetimeunix", "fechahora", "datetime"])
-    # 4) Construir índice de tiempo
-    if date_col and time_col:
-        ts = pd.to_datetime(
-            df[date_col].astype(str).str.replace("\ufeff", "", regex=False).str.strip() + " " +
-            df[time_col].astype(str).str.replace("\ufeff", "", regex=False).str.strip(),
-            errors="coerce",
-            dayfirst=True,
-        )
-    elif combined_col:
-        ts = pd.to_datetime(
-            df[combined_col].astype(str).str.replace("\ufeff", "", regex=False).str.strip(),
-            errors="coerce",
-            dayfirst=True,
-        )
-    else:
-        # último recurso: usar la primera columna como timestamp
-        first_col = df.columns[0]
-        ts = pd.to_datetime(df[first_col], errors="coerce", dayfirst=True)
-
-    # 5) Validar/seleccionar columna del sensor (T o RH)
-    if value_col not in df.columns:
-        # intenta localizar por alias
-        value_col = _find_col_by_alias(df, [value_col, "t", "rh"])
-        if value_col is None:
-            raise KeyError("No se encontró la columna del sensor (p.ej. 'T' o 'RH').")
-
-    # 6) Construir serie
-    s = pd.Series(pd.to_numeric(df[value_col], errors="coerce").values, index=ts)
-    s = s.sort_index()
-    s = s[~s.index.duplicated(keep="first")].dropna()
-    return s
-
-
-def resample_uniform(series, rule):
-    """Resamplea a una rejilla uniforme e interpola huecos."""
-    s = series.resample(rule).mean()
-    s = s.interpolate(method="time").ffill().bfill()
-    return s
-
-
-# =========================
-# DIGITALIZACIÓN
-# =========================
-def downsample(series, factor):
-    """Toma 1 de cada N muestras (simula menor frecuencia de muestreo)."""
-    return series.iloc[::factor].copy()
-
-def uniform_quantize(x, bits):
+# =======================================
+# 3) FILTROS: Kalman 1D y Observador tipo Luenberger (EMA)
+# =======================================
+def kalman_filter_1d(z, R=0.25, Q=0.01):
     """
-    Cuantización uniforme en el rango [min, max] de la señal.
-    Devuelve: (señal cuantizada float, índices de nivel int).
+    Filtro de Kalman 1D para una señal escalar.
+    z : mediciones (np.array)
+    R : varianza del ruido de medición
+    Q : varianza del proceso (suavizado)
+    Devuelve: x_hat (estimado filtrado)
     """
-    x = np.asarray(x, dtype=float)
-    xmin, xmax = np.nanmin(x), np.nanmax(x)
-    if xmax == xmin:
-        return x.copy(), np.zeros_like(x, dtype=int)
-    L = 2**bits
-    # Normaliza a [0, 1]
-    xn = (x - xmin) / (xmax - xmin)
-    # Índices 0..L-1
-    idx = np.clip(np.round(xn * (L - 1)), 0, L - 1).astype(int)
-    # Reconstrucción al centro del nivel (mid-rise)
-    xr = idx / (L - 1) * (xmax - xmin) + xmin
-    return xr, idx
+    x_hat = np.zeros_like(z, dtype=float)
+    P = 1.0  # varianza inicial del error
+    x_hat[0] = z[0]  # estado inicial
 
-
-# =========================
-# ESTIMACIÓN DEL MODELO AR(1)
-# =========================
-def estimate_a_ar1(x):
-    """Estima 'a' de x_{k+1} ≈ a x_k por mínimos cuadrados."""
-    x = np.asarray(x, dtype=float)
-    if len(x) < 2:
-        return 1.0
-    xk, xk1 = x[:-1], x[1:]
-    denom = np.dot(xk, xk)
-    if denom == 0:
-        return 1.0
-    a = float(np.dot(xk1, xk) / denom)
-    # Limita a un rango estable y razonable
-    return max(min(a, 1.2), 0.6)
-
-
-# =========================
-# OBSERVADOR DE LUENBERGER
-# =========================
-def luenberger_observer(y, a, lambda_obs, x0=None):
-    """
-    Sistema:
-        x_{k+1} = a x_k
-        y_k     = x_k
-    Observador:
-        x̂_{k+1} = a x̂_k + L (y_k - x̂_k),  L = a - lambda_obs
-    """
-    L = a - lambda_obs
-    y = np.asarray(y, dtype=float)
-    xhat = np.zeros_like(y)
-    xhat[0] = y[0] if x0 is None else x0
-    for k in range(len(y)-1):
-        xhat[k+1] = a * xhat[k] + L * (y[k] - xhat[k])
-    return xhat
-
-
-# =========================
-# FILTRO DE KALMAN (ESCALAR)
-# =========================
-@dataclass
-class KalmanScalar:
-    a: float
-    q: float
-    r: float
-    x: float
-    P: float
-
-    def step(self, y):
+    for k in range(1, len(z)):
         # Predicción
-        x_pred = self.a * self.x
-        P_pred = self.a * self.P * self.a + self.q
-        # Actualización (H=1)
-        K = P_pred / (P_pred + self.r)
-        self.x = x_pred + K * (y - x_pred)
-        self.P = (1 - K) * P_pred
-        return self.x
+        x_pred = x_hat[k-1]
+        P_pred = P + Q
 
-def kalman_filter(y, a, q, r, x0=None, P0=1.0):
-    y = np.asarray(y, dtype=float)
-    x0 = y[0] if x0 is None else x0
-    kf = KalmanScalar(a=a, q=q, r=r, x=float(x0), P=float(P0))
-    xhat = np.zeros_like(y)
-    for i, yi in enumerate(y):
-        xhat[i] = kf.step(yi)
-    return xhat
+        # Actualización
+        K = P_pred / (P_pred + R)  # Ganancia de Kalman
+        x_hat[k] = x_pred + K * (z[k] - x_pred)
+        P = (1 - K) * P_pred
 
+    return x_hat
 
-# =========================
-# MÉTRICAS
-# =========================
-def mse(a, b):
-    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
-    return np.mean((a - b)**2)
+# Parámetros de ruido: ajusta R (ruido de medición) y Q (suavizado del modelo)
+kalman_R = 0.3**2   # varianza ~ (0.3°C)^2
+kalman_Q = 0.05**2  # varianza del proceso
+data_kalman = kalman_filter_1d(data_raw, R=kalman_R, Q=kalman_Q)
 
-def mae(a, b):
-    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
-    return np.mean(np.abs(a - b))
+def luenberger_like_ema(y, alpha=0.2):
+    """
+    Observador tipo Luenberger de 1er orden (equivalente a un EMA).
+    x_hat_k = x_hat_{k-1} + alpha*(y_k - x_hat_{k-1})
+    """
+    xh = np.zeros_like(y, dtype=float)
+    xh[0] = y[0]
+    for k in range(1, len(y)):
+        xh[k] = xh[k-1] + alpha * (y[k] - xh[k-1])
+    return xh
 
+alpha_obs = 0.15
+data_luenberger = luenberger_like_ema(data_raw, alpha=alpha_obs)
 
-# =========================
-# PROGRAMA PRINCIPAL
-# =========================
-def main():
-    # 1) Carga del raw y rejilla uniforme
-    s_raw = load_timeseries_csv(CSV_PATH, SENSOR_COL, DATE_COL, TIME_COL)
-    s_raw = resample_uniform(s_raw, RAW_RESAMPLE_RULE)
-    s_raw.name = "data_raw"
+# ==================
+# 4) VISUALIZACIONES
+# ==================
+plt.figure(figsize=(12, 6))
+plt.plot(data_raw, label='data_raw (tavg diaria)', linewidth=1.2)
+plt.plot(np.arange(0, len(data_raw), N), data_sampled, 'o-', label=f'sampled (cada {N} días)', linewidth=1.0)
+plt.plot(np.arange(0, len(data_raw), N), data_digitized, 's--', label=f'quantized (niveles={levels})', linewidth=1.0)
+plt.title('Digitalización: Sampling & Quantization (Temperatura diaria)')
+plt.xlabel('muestra (día)')
+plt.ylabel('°C')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
 
-    # 2) Digitalización: muestreo + cuantización
-    s_sampled = downsample(s_raw, DOWNSAMPLE_FACTOR)
-    s_quant, _ = uniform_quantize(s_sampled.values, QUANT_BITS)
-    s_digitized = pd.Series(s_quant, index=s_sampled.index, name="data_digitized")
+plt.figure(figsize=(12, 6))
+plt.plot(data_raw, label='data_raw', linewidth=1.0)
+plt.plot(data_kalman, label='Kalman 1D', linewidth=1.6)
+plt.plot(data_luenberger, label=f'Luenberger/EMA (α={alpha_obs})', linewidth=1.6)
+plt.title('Filtrado: Kalman vs Luenberger (EMA)')
+plt.xlabel('muestra (día)')
+plt.ylabel('°C')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
 
-    # 3) Estimar 'a' (AR(1)) desde el raw
-    a_est = estimate_a_ar1(s_raw.values)
-    print(f"[INFO] a estimado (AR(1)) = {a_est:.4f}")
+# ============================
+# 5) RESULTADOS PARA EL REPORTE
+# ============================
+resultados = {
+    "fs_raw (Hz)": fs_raw,
+    "fs_sampled (Hz)": fs_sampled,
+    "N_sampling": N,
+    "quant_levels": levels,
+    "xmin": float(xmin),
+    "xmax": float(xmax),
+    "q_step": float(q_step),
+    "Kalman_R": kalman_R,
+    "Kalman_Q": kalman_Q,
+    "Luenberger_alpha": alpha_obs,
+    "n_raw": len(data_raw),
+    "n_sampled": len(data_sampled)
+}
 
-    # 4) Luenberger sobre la señal digitalizada
-    xhat_luen = luenberger_observer(s_digitized.values, a=a_est, lambda_obs=LAMBDA_OBS)
-    s_luen = pd.Series(xhat_luen, index=s_digitized.index, name="xhat_luenberger")
+print("\nResumen de parámetros:")
+for k, v in resultados.items():
+    print(f" - {k}: {v}")
 
-    # 5) Kalman sobre la señal digitalizada
-    xhat_kal = kalman_filter(s_digitized.values, a=a_est, q=Q_PROCESS, r=R_MEASURE)
-    s_kal = pd.Series(xhat_kal, index=s_digitized.index, name="xhat_kalman")
+# Si quieres exportar las series para tu informe:
+out = pd.DataFrame({
+    "raw_tavg_C": data_raw,
+    "kalman_tavg_C": data_kalman,
+    "luenberger_tavg_C": data_luenberger
+})
+# Para alinear con el muestreo/cuantización (más esporádicos):
+sample_idx = np.arange(0, len(data_raw), N)
+out_sample = pd.DataFrame({
+    "idx": sample_idx,
+    "sampled_C": data_sampled,
+    "digitized_C": data_digitized
+})
 
-    # 6) Métricas contra el raw alineado a los timestamps digitalizados
-    s_raw_aligned = s_raw.reindex(s_digitized.index).interpolate().ffill().bfill()
-    m_luen_mse = mse(s_luen.values, s_raw_aligned.values)
-    m_kal_mse  = mse(s_kal.values,  s_raw_aligned.values)
-    m_luen_mae = mae(s_luen.values, s_raw_aligned.values)
-    m_kal_mae  = mae(s_kal.values,  s_raw_aligned.values)
-
-    print("\n=== Métricas vs data_raw (alineado) ===")
-    print(f"Luenberger: MSE={m_luen_mse:.6f}  MAE={m_luen_mae:.6f}")
-    print(f"Kalman    : MSE={m_kal_mse:.6f}  MAE={m_kal_mae:.6f}")
-
-    # 7) Guardado opcional
-    if SAVE_OUTPUTS:
-        s_raw.to_csv(f"{OUTPUT_PREFIX}_raw.csv", header=True)
-        s_digitized.to_csv(f"{OUTPUT_PREFIX}_digitized.csv", header=True)
-        s_luen.to_csv(f"{OUTPUT_PREFIX}_luen.csv", header=True)
-        s_kal.to_csv(f"{OUTPUT_PREFIX}_kal.csv", header=True)
-        print(f"[INFO] Resultados guardados con prefijo: {OUTPUT_PREFIX}_*.csv")
-
-    # 8) Gráficas
-    if PLOT_N_SAMPLES is not None:
-        end = min(PLOT_N_SAMPLES, len(s_digitized))
-        sidx = slice(0, end)
-    else:
-        sidx = slice(0, len(s_digitized))
-
-    plt.figure()
-    s_raw_aligned.iloc[sidx].plot(label="raw (alineado)")
-    s_digitized.iloc[sidx].plot(label="digitized (downsample+quantize)")
-    s_luen.iloc[sidx].plot(label="Luenberger")
-    s_kal.iloc[sidx].plot(label="Kalman")
-    plt.title(f"Digitalización y filtros sobre {SENSOR_COL}")
-    plt.xlabel("tiempo")
-    plt.ylabel(SENSOR_COL)
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-
-if __name__ == "__main__":
-    main()
+# Guardado opcional
+# out.to_csv("noaa_temp_filtrado.csv", index=False)
+# out_sample.to_csv("noaa_temp_digitalizado.csv", index=False)
